@@ -414,11 +414,12 @@ class QlLoaderELF(QlLoader):
         raise QlErrorELFFormat('invalid module: symbol init_module not found')
 
     def lkm_dynlinker(self, elffile: ELFFile, mem_start: int) -> Mapping[str, int]:
-        def __get_symbol(name: str) -> Optional[Symbol]:
+        def __get_symbol(symbol_index: int) -> Optional[Symbol]:
             _symtab = elffile.get_section_by_name('.symtab')
-            _sym = _symtab.get_symbol_by_name(name)
 
-            return _sym[0] if _sym else None
+            _sym = _symtab.get_symbol(symbol_index)
+
+            return _sym
 
         ql = self.ql
 
@@ -440,11 +441,15 @@ class QlLoaderELF(QlLoader):
                 symtab = elffile.get_section(reloc_sec['sh_link'])
                 assert isinstance(symtab, SymbolTableSection)
 
+                prev_mips_hi16_loc = []
+
                 for rel in reloc_sec.iter_relocations():
                     # if reloc['r_info_sym'] == 0:
                     #     continue
 
-                    symbol = symtab.get_symbol(rel['r_info_sym'])
+                    symbol_index = rel['r_info_sym']
+                    symbol = symtab.get_symbol(symbol_index)
+                    #ql.log.info(f"Symbol: {vars(symbol)}")
                     assert symbol
 
                     # Some symbols have zero 'st_name', so instead what's used is
@@ -453,19 +458,18 @@ class QlLoaderELF(QlLoader):
                         symsec = elffile.get_section(symbol['st_shndx'])
                         symbol_name = symsec.name
                         sym_offset = symsec['sh_offset']
-
-                        rev_reloc_symbols[symbol_name] = sym_offset + mem_start
+                        rev_reloc_symbols[symbol_index] = sym_offset + mem_start
                     else:
                         symbol_name = symbol.name
                         # get info about related section to be patched
                         info_section = elffile.get_section(reloc_sec['sh_info'])
                         sym_offset = info_section['sh_offset']
 
-                        if symbol_name in all_symbols:
-                            sym_offset = rev_reloc_symbols[symbol_name] - mem_start
+                        if symbol_index in all_symbols:
+                            sym_offset = rev_reloc_symbols[symbol_index] - mem_start
                         else:
-                            all_symbols.append(symbol_name)
-                            _symbol = __get_symbol(symbol_name)
+                            all_symbols.append(symbol_index)
+                            _symbol = __get_symbol(symbol_index)
 
                             if _symbol['st_shndx'] == 'SHN_UNDEF':
                                 # external symbol
@@ -484,17 +488,17 @@ class QlLoaderELF(QlLoader):
                                     ql.mem.write_ptr(self.ql.os.hook_addr, SYSCALL_MEM)
 
                                 # we also need to do reverse lookup from symbol to address
-                                rev_reloc_symbols[symbol_name] = self.ql.os.hook_addr
+                                rev_reloc_symbols[symbol_index] = self.ql.os.hook_addr
                                 sym_offset = self.ql.os.hook_addr - mem_start
                                 self.ql.os.hook_addr += self.ql.arch.pointersize
 
                             elif _symbol['st_shndx'] == 'SHN_ABS':
-                                rev_reloc_symbols[symbol_name] = _symbol['st_value']
+                                rev_reloc_symbols[symbol_index] = _symbol['st_value']
 
                             else:
                                 # local symbol
                                 _section = elffile.get_section(_symbol['st_shndx'])
-                                rev_reloc_symbols[symbol_name] = _section['sh_offset'] + _symbol['st_value'] + mem_start
+                                rev_reloc_symbols[symbol_index] = _section['sh_offset'] + _symbol['st_value'] + mem_start
 
                     # ql.log.info(f'relocating: {symbol_name} -> {rev_reloc_symbols[symbol_name]:#010x}')
 
@@ -506,13 +510,16 @@ class QlLoaderELF(QlLoader):
 
                     desc = describe_reloc_type(rel['r_info_type'], elffile)
 
+                    offset = rel['r_offset']
+                    #ql.log.info(f"{desc} {symbol_name} offset = {offset:x} loc = {loc:x} {rel}")
+
                     if desc in ('R_X86_64_32S', 'R_X86_64_32'):
                         # patch this reloc
                         if rel['r_addend']:
                             val = sym_offset + rel['r_addend']
                             val += mem_start
                         else:
-                            val = rev_reloc_symbols[symbol_name]
+                            val = rev_reloc_symbols[symbol_index]
 
                         ql.mem.write_ptr(loc, (val & 0xFFFFFFFF), 4)
 
@@ -523,37 +530,51 @@ class QlLoaderELF(QlLoader):
 
                     elif desc == 'R_X86_64_PC64':
                         val = rel['r_addend'] - loc
-                        val += rev_reloc_symbols[symbol_name]
+                        val += rev_reloc_symbols[symbol_index]
                         ql.mem.write_ptr(loc, val, 8)
 
                     elif desc in ('R_X86_64_PC32', 'R_X86_64_PLT32'):
                         val = rel['r_addend'] - loc
-                        val += rev_reloc_symbols[symbol_name]
+                        val += rev_reloc_symbols[symbol_index]
                         ql.mem.write_ptr(loc, (val & 0xFFFFFFFF), 4)
 
                     elif desc in ('R_386_PC32', 'R_386_PLT32'):
                         val = ql.mem.read_ptr(loc, 4)
-                        val += rev_reloc_symbols[symbol_name] - loc
+                        val += rev_reloc_symbols[symbol_index] - loc
                         ql.mem.write_ptr(loc, (val & 0xFFFFFFFF), 4)
 
                     elif desc in ('R_386_32', 'R_MIPS_32'):
                         val = ql.mem.read_ptr(loc, 4)
-                        val += rev_reloc_symbols[symbol_name]
+                        val += rev_reloc_symbols[symbol_index]
                         ql.mem.write_ptr(loc, (val & 0xFFFFFFFF), 4)
 
                     elif desc == 'R_MIPS_HI16':
                         # actual relocation is done in R_MIPS_LO16
-                        prev_mips_hi16_loc = loc
+                        #prev_mips_hi16_loc.append(loc)
+                        prev_mips_hi16_loc.insert(0, loc)
 
                     elif desc == 'R_MIPS_LO16':
-                        val = ql.mem.read_ptr(prev_mips_hi16_loc + 2, 2) << 16 | ql.mem.read_ptr(loc + 2, 2)
-                        val = rev_reloc_symbols[symbol_name] + val
-                        # *(word)(mips_lo16_loc + 2) is treated as signed
-                        if (val & 0xFFFF) >= 0x8000:
-                            val += (1 << 16)
+                        a = ql.mem.read_ptr(loc, 2)
 
-                        ql.mem.write_ptr(prev_mips_hi16_loc + 2, (val >> 16), 2)
-                        ql.mem.write_ptr(loc + 2, (val & 0xFFFF), 2)
+                        if a & 0x8000:
+                            a |= ~0xffff
+
+                        val =  rev_reloc_symbols[symbol_index] + a
+
+                        for hi16_loc in prev_mips_hi16_loc:
+                            val = (ql.mem.read_ptr(hi16_loc, 2) << 16) + a
+                            val = rev_reloc_symbols[symbol_index] + val
+
+                            ql.mem.write_ptr(hi16_loc, ((val >> 16) & 0xffff) + (1 if val & 0x8000 else 0), 2)
+
+                        prev_mips_hi16_loc = []
+
+                        ql.mem.write_ptr(loc, (val & 0xFFFF), 2)
+
+                    elif desc == 'R_MIPS_26':
+                        val = ql.mem.read_ptr(loc, 4)
+                        val = (val & ~0x03ffffff) | (val + (rev_reloc_symbols[symbol_index] >> 2) & 0x03ffffff)
+                        ql.mem.write_ptr(loc, val, 4)
 
                     else:
                         raise NotImplementedError(f'Relocation type {desc} not implemented')
@@ -603,16 +624,16 @@ class QlLoaderELF(QlLoader):
         rev_reloc_symbols = self.lkm_dynlinker(elffile, mem_start + loadbase)
 
         # iterate over relocatable symbols, but pick only those who start with 'sys_'
-        for sc, addr in rev_reloc_symbols.items():
-            if sc.startswith('sys_') and sc != 'sys_call_table':
-                tmp_sc = sc[4:]
-
-                if hasattr(SYSCALL_NR, tmp_sc):
-                    syscall_id = getattr(SYSCALL_NR, tmp_sc).value
-                    dest = SYSCALL_MEM + syscall_id * self.ql.arch.pointersize
-
-                    self.ql.log.debug(f'Writing syscall {tmp_sc} to {dest:#x}')
-                    self.ql.mem.write_ptr(dest, addr)
+        #for sc, addr in rev_reloc_symbols.items():
+        #    if sc.startswith('sys_') and sc != 'sys_call_table':
+        #        tmp_sc = sc[4:]
+#
+        #        if hasattr(SYSCALL_NR, tmp_sc):
+        #            syscall_id = getattr(SYSCALL_NR, tmp_sc).value
+        #            dest = SYSCALL_MEM + syscall_id * self.ql.arch.pointersize
+#
+        #            self.ql.log.debug(f'Writing syscall {tmp_sc} to {dest:#x}')
+        #            self.ql.mem.write_ptr(dest, addr)
 
         # write syscall addresses into syscall table
         self.ql.mem.write_ptr(SYSCALL_MEM + 0 * self.ql.arch.pointersize, self.ql.os.hook_addr + 0 * self.ql.arch.pointersize)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# 
+#
 # Cross Platform and Multi Architecture Advanced Binary Emulation Framework
 #
 
@@ -128,7 +128,7 @@ def hook_memset(ql, address, params):
     dest = params["dest"]
     c = params["c"]
     count = params["count"]
-    ql.mem.write(dest, bytes(c) * count)
+    ql.mem.write(dest, bytes([c]) * count)
     return dest
 
 
@@ -150,7 +150,7 @@ def hook_get_by_key(ql, address, params):
     "Ptr": POINTER
 })
 def hook_kfree(ql, address, params):
-    pass
+    ql.os.heap.free(address)
 
 
 @linux_kernel_api(params={
@@ -355,6 +355,9 @@ def hook_sock_release(ql, address, params):
 
 
 @linux_kernel_api(params={
+    "filename" : STRING,
+    "flags": UINT,
+    "mode": UINT
 })
 def hook_filp_open(ql, address, params):
     return 0
